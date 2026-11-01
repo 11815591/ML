@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Build aggregate skill demand from a bounded Headcount Labs India query.
+
+Posting text is processed in memory and never written to disk. The output only
+contains categories and skill counts derived from the existing project catalog.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import csv
+import json
+import logging
+import os
+import random
+import re
+import socket
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+API_BASE = "https://api.headcountlabs.com"
+FIELDS = "job_id,title,description"
+APP_COLUMNS = ("job_id", "category", "job_title", "job_description", "job_skill_set")
+OUTPUT_COLUMNS = ("category", "skill", "distinct_job_count", "window_start_utc", "generated_at_utc")
+TITLE_COLUMNS = ("job_title", "distinct_job_count", "window_start_utc", "generated_at_utc")
+REQUEST_TIMEOUT_SECONDS = 20
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BASE_SECONDS = 1.0
+RETRY_MAX_SECONDS = 30.0
+TRANSIENT_HTTP_CODES = {408, 429, 500, 502, 503, 504}
+LOGGER = logging.getLogger(__name__)
+
+
+def normalize(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower().replace(".", "").replace("-", " ")
+
+
+def parse_skills(value: str) -> list[str]:
+    try:
+        parsed = ast.literal_eval(value)
+        if isinstance(parsed, (list, tuple, set)):
+            return sorted({normalize(item) for item in parsed if normalize(item)})
+    except (ValueError, SyntaxError):
+        pass
+    return sorted({normalize(item) for item in re.split(r"[,;|]", value) if normalize(item)})
+
+
+def field_value(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("value") or "") if value.get("state") == "known" else ""
+    return str(value or "")
+
+
+def load_taxonomy(catalog_path: Path) -> dict[str, set[str]]:
+    taxonomy: dict[str, set[str]] = defaultdict(set)
+    with catalog_path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = set(APP_COLUMNS).difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"Catalog is missing required columns: {sorted(missing)}")
+        for row in reader:
+            category = str(row.get("category") or "").strip()
+            if category:
+                taxonomy[category].update(parse_skills(row.get("job_skill_set") or ""))
+    if not taxonomy:
+        raise ValueError("Catalog taxonomy is empty")
+    return dict(taxonomy)
+
+
+def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
+    """Parse Retry-After as delay-seconds or an HTTP date."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            current = now or datetime.now(timezone.utc)
+            return max(0.0, (retry_at - current).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def request_page(params: dict[str, str], api_key: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> dict:
+    query = urlencode(params)
+    request = Request(
+        f"{API_BASE}/v1/jobs?{query}",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.load(response)
+            break
+        except HTTPError as exc:
+            # Never include response text or request headers: either could contain secrets.
+            if exc.code not in TRANSIENT_HTTP_CODES or attempt == MAX_REQUEST_ATTEMPTS:
+                LOGGER.error("Headcount request failed with HTTP %s (attempt %s/%s)", exc.code, attempt, MAX_REQUEST_ATTEMPTS)
+                raise RuntimeError(f"Headcount API returned HTTP {exc.code}") from None
+            retry_after = retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+            delay = min(RETRY_MAX_SECONDS, retry_after) if retry_after is not None else min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.5, 1.5)
+            LOGGER.warning("Headcount returned HTTP %s; retrying in %.1f seconds (attempt %s/%s)", exc.code, delay, attempt, MAX_REQUEST_ATTEMPTS)
+            time.sleep(delay)
+            continue
+        except (URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
+            if attempt == MAX_REQUEST_ATTEMPTS:
+                LOGGER.error("Headcount request failed after %s attempts (%s)", MAX_REQUEST_ATTEMPTS, type(exc).__name__)
+                raise RuntimeError(f"Headcount API request failed after {MAX_REQUEST_ATTEMPTS} attempts ({type(exc).__name__})") from None
+            delay = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.5, 1.5)
+            LOGGER.warning("Headcount request timed out or failed (%s); retrying in %.1f seconds (attempt %s/%s)", type(exc).__name__, delay, attempt, MAX_REQUEST_ATTEMPTS)
+            time.sleep(delay)
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.error("Headcount request failed (%s); not retrying", type(exc).__name__)
+            raise RuntimeError(f"Headcount API request failed ({type(exc).__name__})") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise RuntimeError("Headcount API returned an unexpected response shape")
+    return payload
+
+
+def extract_skills(description: str, title: str, taxonomy: dict[str, set[str]]) -> dict[str, list[str]]:
+    text = normalize(f"{title} {description}")
+    found: dict[str, list[str]] = {}
+    for category, skills in taxonomy.items():
+        matches = [skill for skill in skills if skill and re.search(rf"(?<![\w]){re.escape(skill)}(?![\w])", text)]
+        if matches:
+            found[category] = matches
+    return found
+
+
+def run(
+    catalog_path: Path,
+    output_path: Path,
+    *,
+    api_key: str,
+    posted_since: str,
+    max_records: int = 250,
+    page_size: int = 100,
+    sleep_seconds: float = 0.2,
+) -> dict[str, int | str]:
+    if not api_key:
+        raise ValueError("HEADCOUNT_API_KEY is required")
+    if not 1 <= max_records <= 1000:
+        raise ValueError("max_records must be between 1 and 1000")
+    if not 1 <= page_size <= 250:
+        raise ValueError("page_size must be between 1 and 250")
+    taxonomy = load_taxonomy(catalog_path)
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    params = {
+        "country": "IN",
+        "currentness": "current",
+        "stale": "false",
+        "posted_since": posted_since,
+        "sort": "updated",
+        "fields": FIELDS,
+        "limit": str(min(page_size, max_records)),
+    }
+    jobs: dict[str, tuple[str, str]] = {}
+    sourced_titles: dict[str, str] = {}
+    title_job_ids: dict[str, set[str]] = defaultdict(set)
+    seen_job_ids: set[str] = set()
+    cursor: str | None = None
+    watermark: str | None = None
+    while True:
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        payload = request_page(page_params, api_key)
+        if watermark is None:
+            watermark = str(payload.get("snapshot_watermark") or "")
+        elif payload.get("snapshot_watermark") != watermark:
+            raise RuntimeError("Headcount catalog watermark changed during pagination; rerun the import")
+        for job in payload["data"]:
+            job_id = str(job.get("job_id") or "").strip()
+            if not job_id:
+                raise RuntimeError("Headcount returned a job without job_id; refusing an uncountable import")
+            if job_id in seen_job_ids:
+                continue
+            seen_job_ids.add(job_id)
+            if len(seen_job_ids) > max_records:
+                raise RuntimeError(f"Import exceeded the safety cap of {max_records} unique API records")
+            title = field_value(job.get("title"))
+            description = field_value(job.get("description"))
+            if title:
+                title_key = re.sub(r"\s+", " ", title).strip().casefold()
+                sourced_titles.setdefault(title_key, re.sub(r"\s+", " ", title).strip())
+                title_job_ids[title_key].add(job_id)
+            if not title or not description:
+                continue
+            jobs[job_id] = (title, description)
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            break
+        if len(seen_job_ids) >= max_records:
+            raise RuntimeError(f"Import reached the safety cap of {max_records} unique API records with more pages remaining")
+        time.sleep(sleep_seconds)
+
+    counts: Counter[tuple[str, str]] = Counter()
+    for title, description in jobs.values():
+        for category, skills in extract_skills(description, title, taxonomy).items():
+            counts.update((category, skill) for skill in skills)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+        for (category, skill), count in sorted(counts.items()):
+            writer.writerow({
+                "category": category,
+                "skill": skill,
+                "distinct_job_count": count,
+                "window_start_utc": posted_since,
+                "generated_at_utc": generated_at,
+            })
+    temporary_path.replace(output_path)
+    titles_path = output_path.with_name("headcount_job_titles.csv")
+    titles_temporary_path = titles_path.with_suffix(titles_path.suffix + ".tmp")
+    with titles_temporary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TITLE_COLUMNS)
+        writer.writeheader()
+        for title_key, title in sorted(sourced_titles.items()):
+            writer.writerow({
+                "job_title": title,
+                "distinct_job_count": len(title_job_ids[title_key]),
+                "window_start_utc": posted_since,
+                "generated_at_utc": generated_at,
+            })
+    titles_temporary_path.replace(titles_path)
+    metadata = {"generated_at_utc": generated_at, "window_start_utc": posted_since, "snapshot_watermark": watermark or "", "api_records": len(seen_job_ids), "processed_jobs": len(jobs), "category_skill_pairs": len(counts), "distinct_title_count": len(sourced_titles), "max_records": max_records}
+    metadata_path = output_path.with_suffix(".metadata.json")
+    metadata_temporary_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    with metadata_temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, sort_keys=True)
+        handle.write("\n")
+    metadata_temporary_path.replace(metadata_path)
+    return {
+        "unique_jobs": len(seen_job_ids),
+        "processed_jobs": len(jobs),
+        "category_skill_pairs": len(counts),
+        "snapshot_watermark": watermark or "",
+        "generated_at_utc": generated_at,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--catalog", type=Path, default=Path("job_catalog.csv"))
+    parser.add_argument("--output", type=Path, default=Path("build/headcount_skill_demand.csv"))
+    parser.add_argument("--posted-since", help="RFC 3339 timestamp; defaults to 48 hours ago")
+    parser.add_argument("--max-records", type=int, default=250)
+    args = parser.parse_args()
+    since = args.posted_since or (datetime.now(timezone.utc) - timedelta(hours=48)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        report = run(args.catalog, args.output, api_key=os.environ.get("HEADCOUNT_API_KEY", ""), posted_since=since, max_records=args.max_records)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

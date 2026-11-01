@@ -1,0 +1,61 @@
+name: Daily India skill demand
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/*'
+    paths:
+      - '.github/workflows/daily-job-data.yml'
+      - 'data_pipeline/**'
+      - 'job_catalog.csv'
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-job-data
+  cancel-in-progress: false
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Run importer tests
+        run: python -B -m unittest discover -s data_pipeline -p 'test_*.py' -v
+      - name: Build bounded aggregate
+        env:
+          HEADCOUNT_API_KEY: ${{ secrets.HEADCOUNT_API_KEY }}
+        run: python data_pipeline/headcount_importer.py --catalog job_catalog.csv --output build/headcount_skill_demand.csv --max-records 250
+      - name: Upload aggregate
+        uses: actions/upload-artifact@v7
+        with:
+          name: india-skill-demand-${{ github.run_id }}
+          path: |
+            build/headcount_skill_demand.csv*
+            build/headcount_job_titles.csv
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish aggregate for the app
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp build/headcount_skill_demand.csv data_pipeline/headcount_skill_demand.csv
+          cp build/headcount_job_titles.csv data_pipeline/headcount_job_titles.csv
+          cp build/headcount_skill_demand.metadata.json data_pipeline/headcount_skill_demand.metadata.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data_pipeline/headcount_skill_demand.csv data_pipeline/headcount_job_titles.csv data_pipeline/headcount_skill_demand.metadata.json
+          if git diff --cached --quiet; then
+            echo "No aggregate changes to publish."
+          else
+            git commit -m "Refresh daily India skill demand"
+            git push
+          fi
